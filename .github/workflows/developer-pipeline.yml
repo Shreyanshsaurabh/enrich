@@ -1,0 +1,86 @@
+name: Developer pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      input_file:
+        description: "Path of the input Excel file inside the repo"
+        default: "data/all_apps.xlsx"
+      limit:
+        description: "Only process the top N developers (0 = all). Use 200 for a test run."
+        default: "0"
+      workers:
+        description: "Parallel scraping workers"
+        default: "12"
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360          # GitHub's maximum for a single job
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install pandas openpyxl requests beautifulsoup4 phonenumbers
+
+      # Restore scraping progress from the previous run (if any)
+      - name: Restore privacy-page cache
+        uses: actions/cache/restore@v4
+        with:
+          path: output/developers_enriched.xlsx.cache.json
+          key: privacy-cache-${{ github.run_id }}
+          restore-keys: |
+            privacy-cache-
+
+      - name: Run pipeline
+        id: pipeline
+        env:
+          INPUT_FILE: ${{ inputs.input_file }}
+          LIMIT: ${{ inputs.limit }}
+          WORKERS: ${{ inputs.workers }}
+        run: |
+          mkdir -p output
+          set +e
+          # Stop the script ourselves at 5h40m so the cache/artifact steps below still run
+          timeout 340m python developer_pipeline.py "$INPUT_FILE" output/developers_enriched.xlsx \
+            --workers "$WORKERS" --limit "$LIMIT"
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+
+      # Save progress even if the run timed out or failed
+      - name: Save privacy-page cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: output/developers_enriched.xlsx.cache.json
+          key: privacy-cache-${{ github.run_id }}
+
+      - name: Upload Excel result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: developers-enriched
+          path: output/developers_enriched.xlsx
+          if-no-files-found: ignore
+
+      - name: Report outcome
+        if: always()
+        env:
+          STATUS: ${{ steps.pipeline.outputs.status }}
+        run: |
+          if [ "$STATUS" = "0" ]; then
+            echo "::notice::Finished. Download 'developers-enriched' from the run's Artifacts."
+          elif [ "$STATUS" = "124" ]; then
+            echo "::notice::Hit the time limit. Progress is saved - run the workflow again to continue."
+          else
+            echo "::error::Script failed with exit code $STATUS"
+            exit 1
+          fi
