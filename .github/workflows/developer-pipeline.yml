@@ -5,7 +5,7 @@ on:
     inputs:
       input_file:
         description: "Path of the input Excel file inside the repo"
-        default: "data/app_apps.xlsx"
+        default: "data/all_apps.xlsx"
       limit:
         description: "Only process the top N developers (0 = all). Use 200 for a test run."
         default: "0"
