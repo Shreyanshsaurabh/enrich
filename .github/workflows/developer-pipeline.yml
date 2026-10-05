@@ -5,13 +5,21 @@ on:
     inputs:
       input_file:
         description: "Path of the input Excel file inside the repo"
-        default: "data/all_apps.xlsx"
+        default: "data/app_apps.xlsx"
       limit:
         description: "Only process the top N developers (0 = all). Use 200 for a test run."
         default: "0"
       workers:
-        description: "Parallel scraping workers"
+        description: "Parallel HTTP workers"
         default: "12"
+      retry_failed:
+        description: "Retry 429 / 5xx / timeout / crashed rows with backoff (rows that worked are skipped)"
+        type: boolean
+        default: true
+      browser_fallback:
+        description: "Retry empty / 403 rows in a headless browser and follow Contact links"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -29,9 +37,13 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install pandas openpyxl requests beautifulsoup4 phonenumbers
+        run: pip install pandas openpyxl requests beautifulsoup4 phonenumbers playwright
 
-      # Restore scraping progress from the previous run (if any)
+      - name: Install headless Chromium
+        if: ${{ inputs.browser_fallback }}
+        run: python -m playwright install --with-deps chromium
+
+      # Restore scraping progress from the previous run, so only failed rows are redone
       - name: Restore privacy-page cache
         uses: actions/cache/restore@v4
         with:
@@ -46,15 +58,21 @@ jobs:
           INPUT_FILE: ${{ inputs.input_file }}
           LIMIT: ${{ inputs.limit }}
           WORKERS: ${{ inputs.workers }}
+          RETRY: ${{ inputs.retry_failed }}
+          BROWSER: ${{ inputs.browser_fallback }}
         run: |
           mkdir -p output
+          ARGS=""
+          [ "$RETRY" = "true" ] && ARGS="$ARGS --retry-failed"
+          [ "$BROWSER" = "true" ] && ARGS="$ARGS --browser-fallback"
           set +e
-          # Stop the script ourselves at 5h40m so the cache/artifact steps below still run
-          timeout 340m python developer_pipeline.py "$INPUT_FILE" output/developers_enriched.xlsx \
-            --workers "$WORKERS" --limit "$LIMIT"
+          # The script stops itself at 335 min and still writes the Excel;
+          # 'timeout' is only a safety net.
+          timeout 345m python developer_pipeline.py "$INPUT_FILE" output/developers_enriched.xlsx \
+            --workers "$WORKERS" --limit "$LIMIT" --max-minutes 335 $ARGS
           echo "status=$?" >> "$GITHUB_OUTPUT"
 
-      # Save progress even if the run timed out or failed
+      # Save progress even if the run stopped early or failed
       - name: Save privacy-page cache
         if: always()
         uses: actions/cache/save@v4
@@ -77,8 +95,8 @@ jobs:
         run: |
           if [ "$STATUS" = "0" ]; then
             echo "::notice::Finished. Download 'developers-enriched' from the run's Artifacts."
-          elif [ "$STATUS" = "124" ]; then
-            echo "::notice::Hit the time limit. Progress is saved - run the workflow again to continue."
+          elif [ "$STATUS" = "3" ] || [ "$STATUS" = "124" ]; then
+            echo "::notice::Stopped at the time limit. Progress is saved - run the workflow again to continue."
           else
             echo "::error::Script failed with exit code $STATUS"
             exit 1
